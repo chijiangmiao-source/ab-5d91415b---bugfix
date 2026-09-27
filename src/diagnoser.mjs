@@ -17,55 +17,52 @@
 // 闭环内既有移动故障副本的边、又有移动正常副本的边（因此闭环重复时
 // 两侧都是无限执行；仅故障副本静默自环、正常侧停滞不算）。
 
+// 正常副本位置必须逐位置精确追踪：仅凭“一步出边回执签名”归类会把
+// 后继不同的位置（如 D1 --b--> D2 与 D2 --b--> E）错误合并，凭空制造
+// 可重复闭环。verifier 状态即精确三元组 (p, q, f)。
 export function buildVerifier(model) {
-  const { init, locations, transitions } = model;
+  const { init, transitions } = model;
   const out = new Map();
-  for (const t of transitions) {
+  // 按迁移标识确定序排列，保证裁决与证据不依赖录入顺序
+  for (const t of [...transitions].sort((x, y) =>
+    (x.id < y.id ? -1 : x.id > y.id ? 1 : 0))) {
     if (!out.has(t.src)) out.set(t.src, []);
     out.get(t.src).push(t);
   }
   const from = (p) => out.get(p) ?? [];
 
-  const normalClass = new Map();
-  const normalMembers = new Map();
-  const profile = (location) => from(location)
-    .filter((t) => !t.faulty)
-    .map((t) => t.silent ? 'S' : `V:${t.receipt}`)
-    .sort()
-    .join('\u001f');
-  for (const location of locations) {
-    const key = location === init ? `INIT:${location}` : profile(location);
-    if (!normalMembers.has(key)) normalMembers.set(key, []);
-    normalMembers.get(key).push(location);
-    normalClass.set(location, key);
-  }
-
+  // states: p -> q -> f -> state（嵌套 Map，避免位置名拼接碰撞）；
+  // all 按发现编号（id）有序保存
   const states = new Map();
+  const all = [];
   const get = (p, q, f) => {
-    const qClass = normalClass.get(q);
-    const k = `${p} ${qClass} ${f}`;
-    let s = states.get(k);
+    let qm = states.get(p);
+    if (!qm) { qm = new Map(); states.set(p, qm); }
+    let fm = qm.get(q);
+    if (!fm) { fm = new Map(); qm.set(q, fm); }
+    let s = fm.get(f);
     if (!s) {
-      s = { id: states.size, p, q, qClass, f, edges: [] };
-      states.set(k, s);
+      s = { id: all.length, p, q, f, edges: [] };
+      fm.set(f, s);
+      all.push(s);
     }
     return s;
   };
 
   let edgeSeq = 0;
+  const queue = [];
   const addEdge = (s, ns, edge) => {
     s.edges.push({ seq: edgeSeq++, ...edge, to: ns });
     if (!ns.enqueued) { ns.enqueued = true; queue.push(ns); }
   };
 
   const start = get(init, init, 0);
-  const queue = [start];
+  queue.push(start);
   for (let head = 0; head < queue.length; head++) {
     const s = queue[head];
     const a = from(s.p);
-    const b = normalMembers.get(s.qClass)
-      .flatMap((location) => from(location))
-      .filter((t) => !t.faulty);
+    // 正常副本是删除全部 F 迁移后的同一自动机：只允许从精确位置 q 出发的 N 迁移
+    const b = from(s.q).filter((t) => !t.faulty);
 
     // F_SILENT：故障副本单独静默（F 或 N）
     for (const x of a) {
@@ -92,7 +89,7 @@ export function buildVerifier(model) {
     }
   }
 
-  return { states: [...states.values()], start };
+  return { states: all, start };
 }
 
 // 迭代式 Tarjan SCC（显式栈，避免 verifier 状态数万时递归栈溢出）

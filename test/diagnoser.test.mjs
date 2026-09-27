@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseSpec } from '../src/parser.mjs';
 import { diagnose, buildVerifier, tarjan } from '../src/diagnoser.mjs';
+import { analyze as analyzeSpec } from '../src/analyze.mjs';
 
 function analyze(text) {
   const m = parseSpec(text);
@@ -186,3 +187,162 @@ test('SCC 标记：单侧环不被当作双侧环', () => {
     }
   }
 });
+
+// 深海采集站回归：故障侧 S --a--> F 后在 F 上持续 b；正常侧 S --a--> D1
+// --b--> D2 --b--> 汇点 E。正常执行有限结束，绝不能与无限故障执行伪装。
+const DEEP_SEA = `
+loc S
+loc F
+loc D1
+loc D2
+loc E
+init S
+trans fa S F F a
+trans fb F F N b
+trans d1 S D1 N a
+trans d2 D1 D2 N b
+trans d3 D2 E N b
+`;
+
+test('深海采集站：有限正常路径不得被判不可诊断（无伪装闭环）', () => {
+  const r = analyzeSpec(DEEP_SEA);
+  assert.equal(r.ok, true);
+  assert.equal(r.diagnosable, true);
+  assert.equal(r.witness, undefined);
+  // 给出已检查诊断对的停滞摘要，而非伪装证据
+  assert.ok(r.checkedPairs.length > 0);
+  assert.ok(r.checkedPairs.every((x) => x.verdict !== 'ambiguous'));
+  // 正常侧真正停滞在汇点 E 的对必须被记录
+  assert.ok(r.checkedPairs.some((x) => x.p === 'F' && x.q === 'E'));
+});
+
+test('深海采集站：verifier 精确追踪 D1 与 D2（不得按一步签名合并）', () => {
+  const m = parseSpec(DEEP_SEA);
+  const v = buildVerifier(m);
+  // (F,D1) 与 (F,D2) 必须是两个不同的可达 f=1 状态，且不存在自环
+  const at = (p, q) => v.states.find((s) => s.p === p && s.q === q && s.f === 1);
+  const sD1 = at('F', 'D1');
+  const sD2 = at('F', 'D2');
+  assert.ok(sD1 && sD2, '故障后两个正常位置都应作为独立状态可达');
+  assert.notEqual(sD1.id, sD2.id);
+  for (const s of [sD1, sD2]) {
+    for (const e of s.edges) assert.notEqual(e.to, s, '不得出现凭空自环');
+  }
+});
+
+// 同一即时回执 a，但两个后继行为不同：一支可继续无限 b，另一支止于汇点。
+// 错误的“一步签名合并”会把它们当作同一状态而误判；这里必须判可诊断。
+const SAME_RECEIPT_DIFFERENT_SUCCESSOR = `
+loc 0
+loc 1
+loc 2
+loc 3
+loc 4
+init 0
+trans f1 0 1 F a
+trans fb 1 1 N b
+trans na 0 2 N a
+trans nb1 2 3 N b
+trans nb2 3 4 N b
+`;
+
+test('同回执但后继不同的分支：正常侧有限 ⇒ 可诊断', () => {
+  const r = analyzeSpec(SAME_RECEIPT_DIFFERENT_SUCCESSOR);
+  assert.equal(r.diagnosable, true);
+});
+
+// 仅单侧能无限执行：故障侧 b 自环，正常侧 a 之后无任何 b 可走（停滞）。
+const ONE_SIDE_INFINITE = `
+loc 0
+loc 1
+loc 2
+init 0
+trans f1 0 1 F a
+trans fb 1 1 N b
+trans n1 0 2 N a
+`;
+
+test('仅故障侧能无限执行（正常侧停滞）⇒ 可诊断', () => {
+  const r = analyzeSpec(ONE_SIDE_INFINITE);
+  assert.equal(r.diagnosable, true);
+  const pair = r.checkedPairs.find((x) => x.p === '1' && x.q === '2');
+  assert.ok(pair);
+  assert.notEqual(pair.verdict, 'ambiguous');
+});
+
+// 有限同回执前缀：两侧共享有限的 a,b 前缀，之后只有故障侧继续。
+const FINITE_COMMON_PREFIX = `
+loc 0
+loc 1
+loc 2
+loc 3
+init 0
+trans f1 0 1 F a
+trans f2 1 1 N b
+trans n1 0 2 N a
+trans n2 2 3 N b
+`;
+
+test('有限同回执前缀后正常侧结束 ⇒ 可诊断', () => {
+  const r = analyzeSpec(FINITE_COMMON_PREFIX);
+  assert.equal(r.diagnosable, true);
+});
+
+test('不可诊断证据必须通过逐步连续性核验（静默双环）', () => {
+  const r = analyzeSpec(SILENT_DOUBLE_LOOP);
+  assert.equal(r.diagnosable, false);
+  assert.equal(r.witness.continuityValid, true);
+  assert.equal(r.witness.continuityError, null);
+});
+
+// 录入顺序重排：位置与迁移声明顺序变化不得改变裁决与证据
+function reorderSpec(text) {
+  const lines = text.split('\n').filter((l) => l.trim() !== '');
+  const init = lines.filter((l) => l.startsWith('init'));
+  const locs = lines.filter((l) => l.startsWith('loc')).reverse();
+  const trans = lines.filter((l) => l.startsWith('trans')).reverse();
+  return [...init, ...trans, ...locs].join('\n') + '\n';
+}
+
+test('输入重排不改变裁决与证据（静默双环）', () => {
+  const a = analyzeSpec(SILENT_DOUBLE_LOOP);
+  const b = analyzeSpec(reorderSpec(SILENT_DOUBLE_LOOP));
+  assert.equal(b.diagnosable, false);
+  const sig = (r) => JSON.stringify({
+    prefix: r.witness.prefix.map((e) => [e.mode, e.faultySide.transId, e.normalSide?.transId ?? null]),
+    loop: r.witness.loop.map((e) => [e.mode, e.faultySide.transId, e.normalSide?.transId ?? null]),
+  });
+  assert.equal(sig(a), sig(b));
+  assert.equal(b.witness.continuityValid, true);
+});
+
+test('输入重排不改变裁决（深海可诊断例）', () => {
+  const a = analyzeSpec(DEEP_SEA);
+  const b = analyzeSpec(reorderSpec(DEEP_SEA));
+  assert.equal(a.diagnosable, true);
+  assert.equal(b.diagnosable, true);
+});
+
+test('正常侧经静默迁移的有效伪装仍被识别（不漏判）', () => {
+  const r = analyzeSpec(N_SILENT_REQUIRED);
+  assert.equal(r.diagnosable, false);
+  assert.equal(r.witness.continuityValid, true);
+});
+
+test('真实同回执双环仍判不可诊断，证据逐步连续', () => {
+  const spec = `
+loc 0
+loc 1
+loc 2
+loc 3
+init 0
+trans f1 0 1 F a
+trans f2 1 1 N b
+trans n1 0 2 N a
+trans n2 2 2 N b
+`;
+  const r = analyzeSpec(spec);
+  assert.equal(r.diagnosable, false);
+  assert.equal(r.witness.continuityValid, true);
+});
+
