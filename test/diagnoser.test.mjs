@@ -186,3 +186,150 @@ test('SCC 标记：单侧环不被当作双侧环', () => {
     }
   }
 });
+
+// 深海采集站规程（复核样例）：故障侧 S --a(F)--> F 后在 F 上持续回执 b；
+// 正常侧只能 S --a--> D1 --b--> D2 --b--> E，E 为汇点。
+// 正常执行在有限回执后结束，无法与故障侧的无限执行持续相同 ⇒ 可诊断。
+// 缺陷版本按“一步出边轮廓”合并 F/D1/D2，会虚构 fb 在正常侧的自环，
+// 给出 [b]ω 的伪装闭环——本测试锁定该回归。
+const FINITE_NORMAL_PATH = `
+loc S
+loc F
+loc D1
+loc D2
+loc E
+init S
+trans tf S F F a
+trans fb F F N b
+trans n1 S D1 N a
+trans n2 D1 D2 N b
+trans n3 D2 E N b
+`;
+
+test('有限正常路径：正常侧在 E 终结，不得给出伪装闭环 ⇒ 可诊断', () => {
+  const r = analyze(FINITE_NORMAL_PATH);
+  assert.equal(r.diagnosable, true);
+  assert.equal(r.witness, null);
+  // 已检查诊断对为有限/停滞摘要：(F,D1)、(F,D2)、(F,E) 均非歧义
+  const pairs = r.checkedPairs.map((x) => `${x.p},${x.q}:${x.verdict}`);
+  for (const key of ['F,D1', 'F,D2', 'F,E']) {
+    const hit = pairs.find((p) => p.startsWith(`${key}:`));
+    assert.ok(hit, `应包含诊断对 ${key}`);
+    assert.ok(!hit.endsWith(':ambiguous'), `诊断对 ${key} 不得为歧义`);
+  }
+});
+
+test('同一即时回执但后继不同的分支：无限侧不得借用有限侧的未来', () => {
+  // F 自环 b 无限；正常侧 a 之后有两条同回执 b 的分支，均在一步内终结
+  const text = `
+loc S
+loc F
+loc D1
+loc D2
+init S
+trans tf S F F a
+trans fb F F N b
+trans n1 S D1 N a
+trans n2 D1 D2 N b
+trans n3 D2 D2 N c
+`;
+  const r = analyze(text);
+  assert.equal(r.diagnosable, true, '正常侧 b 之后只余 c，无法持续复制 b');
+});
+
+test('仅单侧能无限执行（故障侧有限、正常侧无限）⇒ 可诊断', () => {
+  const r = analyze(`
+loc 0
+loc 1
+loc 2
+init 0
+trans f1 0 1 F a
+trans n1 0 2 N a
+trans n2 2 2 N b
+`);
+  assert.equal(r.diagnosable, true);
+  assert.equal(r.witness, null);
+});
+
+test('证据中每一侧的迁移必须逐步连续衔接（from 接续上一步的 to）', () => {
+  // 对全部既有不可诊断样例逐一核验两侧迁移链
+  for (const text of [SILENT_DOUBLE_LOOP, N_SILENT_REQUIRED, `
+loc 0
+loc 1
+loc 2
+loc 3
+init 0
+trans f1 0 1 F a
+trans f2 1 1 N b
+trans n1 0 2 N a
+trans n2 2 2 N b
+`]) {
+    const m = parseSpec(text);
+    const v = buildVerifier(m);
+    const r = diagnose(m);
+    assert.equal(r.diagnosable, false);
+    let cur = v.start;
+    let fLoc = cur.p;
+    let nLoc = cur.q;
+    const walk = (steps, phase) => {
+      for (const [i, step] of steps.entries()) {
+        const e = cur.edges.find((x) =>
+          (x.fTrans?.id ?? null) === step.faultySide.transId &&
+          (x.nTrans?.id ?? null) === (step.normalSide?.transId ?? null) &&
+          x.mode === step.mode);
+        assert.ok(e, `${phase}${i + 1}：证据步必须是 verifier 真实边`);
+        if (e.fTrans) {
+          assert.equal(e.fTrans.src, fLoc,
+            `${phase}${i + 1}：故障侧迁移须从当前位置 ${fLoc} 出发`);
+          fLoc = e.fTrans.dst;
+        }
+        if (e.nTrans) {
+          assert.equal(e.nTrans.src, nLoc,
+            `${phase}${i + 1}：正常侧迁移须从当前位置 ${nLoc} 出发，实际 ${e.nTrans.src}`);
+          assert.equal(e.nTrans.faulty, false);
+          nLoc = e.nTrans.dst;
+        }
+        cur = e.to;
+      }
+    };
+    walk(r.witness.prefix, '前缀');
+    assert.equal(fLoc, r.witness.entry.p);
+    assert.equal(nLoc, r.witness.entry.q);
+    walk(r.witness.loop, '闭环');
+    assert.equal(fLoc, r.witness.entry.p, '闭环后故障侧须回到入口');
+    assert.equal(nLoc, r.witness.entry.q, '闭环后正常侧须回到入口');
+  }
+});
+
+test('裁决与证据对录入顺序稳定（位置与迁移重排）', () => {
+  const sig = (r) => JSON.stringify({
+    d: r.diagnosable,
+    pairs: r.checkedPairs,
+    w: r.witness ? {
+      entry: r.witness.entry,
+      prefix: r.witness.prefix.map((e) =>
+        [e.mode, e.faultySide.transId, e.normalSide?.transId ?? null]),
+      loop: r.witness.loop.map((e) =>
+        [e.mode, e.faultySide.transId, e.normalSide?.transId ?? null]),
+    } : null,
+  });
+  // 确定性伪随机打乱声明行（保留 init 位置无关紧要，仅用于制造多种排列）
+  const reorder = (text, seed) => {
+    const lines = text.split('\n').filter((l) => l.trim() !== '');
+    let s = seed >>> 0;
+    const out = [...lines];
+    for (let i = out.length - 1; i > 0; i--) {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      const j = s % (i + 1);
+      [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out.join('\n');
+  };
+  for (const text of [SILENT_DOUBLE_LOOP, FINITE_NORMAL_PATH]) {
+    const base = sig(analyze(text));
+    for (let seed = 1; seed <= 8; seed++) {
+      assert.equal(sig(analyze(reorder(text, seed * 7919 + 13))), base,
+        `重排种子 ${seed} 后裁决/证据发生变化`);
+    }
+  }
+});

@@ -50,6 +50,42 @@ test('可诊断回执经 HTTP 判为可诊断', async () => {
   assert.equal(json.result.diagnosable, true);
 });
 
+test('有限正常路径经 HTTP 判可诊断：无伪装闭环，返回诊断对摘要', async () => {
+  const spec = [
+    'loc S', 'loc F', 'loc D1', 'loc D2', 'loc E', 'init S',
+    'trans tf S F F a',
+    'trans fb F F N b',
+    'trans n1 S D1 N a',
+    'trans n2 D1 D2 N b',
+    'trans n3 D2 E N b',
+  ].join('\n');
+  const { status, json } = await post('/api/analyze', { jobId: 't-finite', spec });
+  assert.equal(status, 200);
+  assert.equal(json.result.ok, true);
+  assert.equal(json.result.diagnosable, true);
+  // 不应给出任何伪装闭环证据
+  assert.equal(json.result.witness, undefined);
+  // 必须给出已检查诊断对的有限/停滞摘要
+  assert.ok(Array.isArray(json.result.checkedPairs));
+  assert.ok(json.result.checkedPairs.length >= 1);
+  assert.ok(json.result.checkedPairs.every((p) => p.verdict !== 'ambiguous'));
+});
+
+test('静默路径有效伪装经 HTTP 仍判不可诊断且证据连续', async () => {
+  const spec = [
+    'loc 0', 'loc 1', 'loc 2', 'loc 3', 'loc 4', 'init 0',
+    'trans f1 0 1 F SILENT',
+    'trans fa 1 2 N a', 'trans floop 2 2 N a',
+    'trans ne 0 3 N SILENT',
+    'trans na 3 4 N a', 'trans nloop 4 4 N a',
+  ].join('\n');
+  const { status, json } = await post('/api/analyze', { jobId: 't-silent-path', spec });
+  assert.equal(status, 200);
+  assert.equal(json.result.diagnosable, false);
+  assert.ok(json.result.witness.loop.length >= 1);
+  assert.equal(json.result.witness.continuityValid, true);
+});
+
 test('悬空目标返回定位错误且无结论', async () => {
   const { status, json } = await post('/api/analyze',
     { jobId: 't3', spec: 'loc 0\ninit 0\ntrans t1 0 ZZ N ok\n' });

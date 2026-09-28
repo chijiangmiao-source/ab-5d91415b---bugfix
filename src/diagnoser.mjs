@@ -16,9 +16,15 @@
 // 不可诊断 ⇔ 从初态可达的某个 f=1 SCC 中，存在一条“合格闭环”：
 // 闭环内既有移动故障副本的边、又有移动正常副本的边（因此闭环重复时
 // 两侧都是无限执行；仅故障副本静默自环、正常侧停滞不算）。
+//
+// 关键：正常副本的位置 q 必须逐一保留，绝不能按“一步出边回执轮廓”等
+// 局部特征把多个位置合并。轮廓相同只代表即时回执相同，后继未来可能不同
+// （一侧在 F 上无限自环、另一侧经 D1→D2 有限终结于 E）；一旦合并，
+// 正常副本就会被允许走一条源位置根本不属于 q 的迁移，从而虚构出
+// “看似可重复的伪装闭环”，把可诊断规程误判为不可诊断。
 
 export function buildVerifier(model) {
-  const { init, locations, transitions } = model;
+  const { init, transitions } = model;
   const out = new Map();
   for (const t of transitions) {
     if (!out.has(t.src)) out.set(t.src, []);
@@ -26,27 +32,12 @@ export function buildVerifier(model) {
   }
   const from = (p) => out.get(p) ?? [];
 
-  const normalClass = new Map();
-  const normalMembers = new Map();
-  const profile = (location) => from(location)
-    .filter((t) => !t.faulty)
-    .map((t) => t.silent ? 'S' : `V:${t.receipt}`)
-    .sort()
-    .join('\u001f');
-  for (const location of locations) {
-    const key = location === init ? `INIT:${location}` : profile(location);
-    if (!normalMembers.has(key)) normalMembers.set(key, []);
-    normalMembers.get(key).push(location);
-    normalClass.set(location, key);
-  }
-
   const states = new Map();
   const get = (p, q, f) => {
-    const qClass = normalClass.get(q);
-    const k = `${p} ${qClass} ${f}`;
+    const k = `${p} ${q} ${f}`;
     let s = states.get(k);
     if (!s) {
-      s = { id: states.size, p, q, qClass, f, edges: [] };
+      s = { id: states.size, p, q, f, edges: [] };
       states.set(k, s);
     }
     return s;
@@ -63,9 +54,8 @@ export function buildVerifier(model) {
   for (let head = 0; head < queue.length; head++) {
     const s = queue[head];
     const a = from(s.p);
-    const b = normalMembers.get(s.qClass)
-      .flatMap((location) => from(location))
-      .filter((t) => !t.faulty);
+    // 正常副本只走 N 迁移，且迁移必须真实源自其当前位置 s.q
+    const b = from(s.q).filter((t) => !t.faulty);
 
     // F_SILENT：故障副本单独静默（F 或 N）
     for (const x of a) {

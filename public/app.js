@@ -204,13 +204,16 @@ function witnessCard(w) {
   const same = w.sequencesIdentical
     ? '<span style="color:var(--good)">✓ 两侧可观察序列逐元素相同</span>'
     : '<span style="color:var(--bad)">✗ 内部校验失败：序列不一致</span>';
+  const continuous = w.continuityValid
+    ? '<span style="color:var(--good)">✓ 两侧迁移逐步连续衔接，闭环回到入口</span>'
+    : '<span style="color:var(--bad)">✗ 内部校验失败：迁移不连续</span>';
   return `
   <div class="card">
     <h3>最短共同前缀（公共可观察回执长度 ${w.prefixReceiptLength}）</h3>
     <div class="seq"><span class="prefix-part">${seqP || '∅（故障静默，前缀无任何回执）'}</span></div>
     <h3 style="margin-top:12px">可重复闭环（每轮回执长度 ${w.loopReceiptLength}，可无限重复）</h3>
     <div class="seq"><span class="loop-part">[ ${seqL} ] ω</span></div>
-    <div class="tabs" style="margin-top:8px">${same}</div>
+    <div class="tabs" style="margin-top:8px">${same}　${continuous}</div>
     <h3 style="margin-top:10px">两侧逐步迁移对应</h3>
     ${stepTable(w.prefix, w.loop)}
     <div class="tabs" style="margin-top:8px">
